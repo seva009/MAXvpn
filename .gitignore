@@ -1,0 +1,49 @@
+# Sensitive credentials & local configs
+config.json
+config_caller.json
+caller_config.json
+*.local.json
+
+# Build artifacts & binaries
+dist/
+gotunnel/dist/
+/calltunnel-relay*
+gotunnel/calltunnel-relay*
+!*.service
+*.exe
+*.o
+*.a
+*.so
+*.dylib
+scratch/test_aes_gcm
+scratch/test_lz4_msgpack
+scratch/test_rtc_minimal
+scratch/test_ws_connect
+scratch/test_cross_decrypt
+scratch/*.bin
+
+# Old / unused C++ implementation
+libdatachannel/
+
+# Large capture archives
+*.har
+
+# Python cache & virtual environments
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.env
+.venv
+env/
+venv/
+
+# Editor and OS swap / temp files
+*.swp
+*.swo
+*.kate-swp
+*~
+.DS_Store
+.idea/
+.vscode/

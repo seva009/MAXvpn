@@ -1,0 +1,267 @@
+// Package relay is a line-for-line port of tunnel_relay.py. It is the piece
+// that runs on the receiving side (Raspberry Pi / server): it receives
+// AES-GCM encrypted requests from the caller over the WebRTC DataChannel,
+// opens outbound TCP connections to the real Internet targets, and relays
+// decrypted data bidirectionally. The connection bookkeeping (conn_id ->
+// socket map, CONNECT/CONNECT_OK/CONNECT_FAIL/DATA/CLOSE handling) mirrors
+// the Python TunnelRelay class exactly.
+package relay
+
+import (
+	"context"
+	"errors"
+	"io"
+	"log"
+	"net"
+	"sync"
+	"time"
+
+	"calltunnel/internal/tunnelcrypto"
+)
+
+// ChunkSize mirrors CHUNK_SIZE in tunnel_relay.py / socks5_server.py (4 KB
+// WebRTC DataChannel frame size for reduced SCTP packet loss and lower latency).
+const ChunkSize = 4096
+
+// SendPacketFunc matches the Python send_packet_fn callable: it hands an
+// already-encrypted packet to the DataChannel for transmission. Returns true
+// if the packet was accepted for delivery.
+type SendPacketFunc func(packet []byte) bool
+
+type conn struct {
+	nc        net.Conn
+	cancel    context.CancelFunc
+	writeChan chan []byte
+}
+
+// GetBufferedAmountFunc returns the current WebRTC DataChannel buffered bytes.
+type GetBufferedAmountFunc func() uint64
+
+// TunnelRelay is the Go equivalent of tunnel_relay.py's TunnelRelay class.
+type TunnelRelay struct {
+	crypto            *tunnelcrypto.TunnelCrypto
+	sendPacket        SendPacketFunc
+	getBufferedAmount GetBufferedAmountFunc
+	mu                sync.Mutex
+	activeConns       map[uint32]*conn
+	running           bool
+}
+
+// New constructs a TunnelRelay, mirroring TunnelRelay.__init__.
+func New(crypto *tunnelcrypto.TunnelCrypto, sendPacket SendPacketFunc, getBufferedAmount GetBufferedAmountFunc) *TunnelRelay {
+	return &TunnelRelay{
+		crypto:            crypto,
+		sendPacket:        sendPacket,
+		getBufferedAmount: getBufferedAmount,
+		activeConns:       make(map[uint32]*conn),
+		running:           true,
+	}
+}
+
+// Stop mirrors TunnelRelay.stop(): cancel every outbound connection's reader
+// loop and close its socket.
+func (r *TunnelRelay) Stop() {
+	r.mu.Lock()
+	r.running = false
+	conns := r.activeConns
+	r.activeConns = make(map[uint32]*conn)
+	r.mu.Unlock()
+
+	for _, c := range conns {
+		c.cancel()
+		_ = c.nc.Close()
+	}
+	log.Println("[Tunnel Relay] Stopped all active internet connections.")
+}
+
+// HandleChannelPacket mirrors TunnelRelay.handle_channel_packet: called
+// whenever an encrypted packet arrives from the caller via the DataChannel.
+func (r *TunnelRelay) HandleChannelPacket(raw []byte) {
+	msgType, connID, payload, err := r.crypto.Decrypt(raw)
+	if err != nil {
+		log.Printf("[Tunnel Relay RX] Failed to decrypt packet: %v", err)
+		return
+	}
+
+	switch msgType {
+	case tunnelcrypto.CmdConnect:
+		host, port, uerr := tunnelcrypto.UnpackConnectPayload(payload)
+		if uerr != nil {
+			log.Printf("[Tunnel Relay] Error unpacking connect payload #%d: %v", connID, uerr)
+			if pkt, eerr := r.crypto.Encrypt(tunnelcrypto.CmdConnectFail, connID, []byte(uerr.Error())); eerr == nil {
+				r.sendPacket(pkt)
+			}
+			return
+		}
+		log.Printf("[Tunnel Relay RX] CONNECT request #%d -> %s:%d", connID, host, port)
+		go r.handleConnect(connID, host, port)
+
+	case tunnelcrypto.CmdData:
+		r.mu.Lock()
+		c, ok := r.activeConns[connID]
+		r.mu.Unlock()
+		if ok {
+			select {
+			case c.writeChan <- payload:
+			default:
+				// Decoupled write buffer to prevent blocking Pion's OnMessage loop
+				log.Printf("[Tunnel Relay] Target conn #%d write buffer full, dropping packet", connID)
+			}
+		}
+
+	case tunnelcrypto.CmdClose:
+		log.Printf("[Tunnel Relay RX] CLOSE request #%d", connID)
+		r.mu.Lock()
+		c, ok := r.activeConns[connID]
+		if ok {
+			delete(r.activeConns, connID)
+		}
+		r.mu.Unlock()
+		if ok {
+			c.cancel()
+			_ = c.nc.Close()
+		}
+	}
+}
+
+// connWriterLoop drains the per-connection write channel and writes to the TCP socket.
+func (r *TunnelRelay) connWriterLoop(ctx context.Context, connID uint32, nc net.Conn, writeChan <-chan []byte) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case data, ok := <-writeChan:
+			if !ok {
+				return
+			}
+			if _, err := nc.Write(data); err != nil {
+				if ctx.Err() == nil && !errors.Is(err, net.ErrClosed) {
+					log.Printf("[Tunnel Relay] Error writing to target conn #%d: %v", connID, err)
+				}
+				return
+			}
+		}
+	}
+}
+
+// handleConnect mirrors TunnelRelay._handle_connect.
+func (r *TunnelRelay) handleConnect(connID uint32, host string, port uint16) {
+	log.Printf("[Tunnel Relay] Connecting to %s:%d for conn #%d...", host, port, connID)
+
+	dialer := net.Dialer{
+		Timeout:       5 * time.Second,
+		FallbackDelay: 250 * time.Millisecond,
+	}
+	addr := net.JoinHostPort(host, portToString(port))
+	nc, err := dialer.Dial("tcp", addr)
+	if err != nil {
+		log.Printf("[Tunnel Relay] Failed to connect to %s:%d for conn #%d: %v", host, port, connID, err)
+		if pkt, eerr := r.crypto.Encrypt(tunnelcrypto.CmdConnectFail, connID, []byte(err.Error())); eerr == nil {
+			log.Printf("[Tunnel Relay TX] Sending CONNECT_FAIL #%d", connID)
+			r.sendPacket(pkt)
+		}
+		return
+	}
+	if tcpConn, ok := nc.(*net.TCPConn); ok {
+		_ = tcpConn.SetNoDelay(true)
+		_ = tcpConn.SetKeepAlive(true)
+		_ = tcpConn.SetKeepAlivePeriod(30 * time.Second)
+	}
+	log.Printf("[Tunnel Relay] CONNECTED to %s:%d for conn #%d!", host, port, connID)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	writeChan := make(chan []byte, 128)
+	c := &conn{nc: nc, cancel: cancel, writeChan: writeChan}
+
+	r.mu.Lock()
+	if !r.running {
+		r.mu.Unlock()
+		cancel()
+		_ = nc.Close()
+		return
+	}
+	r.activeConns[connID] = c
+	r.mu.Unlock()
+
+	go r.connWriterLoop(ctx, connID, nc, writeChan)
+	go r.remoteReaderLoop(ctx, connID, nc)
+
+	if pkt, eerr := r.crypto.Encrypt(tunnelcrypto.CmdConnectOK, connID, nil); eerr == nil {
+		log.Printf("[Tunnel Relay TX] Sending CONNECT_OK #%d", connID)
+		r.sendPacket(pkt)
+	}
+}
+
+// remoteReaderLoop mirrors TunnelRelay._remote_reader_loop: reads from the
+// target TCP socket and ships each chunk back over the DataChannel,
+// finishing with a CLOSE notification.
+func (r *TunnelRelay) remoteReaderLoop(ctx context.Context, connID uint32, nc net.Conn) {
+	buf := make([]byte, ChunkSize)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+
+		// Backpressure: pause reading from target if outbound DataChannel SCTP buffer is full
+		if r.getBufferedAmount != nil {
+			for r.getBufferedAmount() > 512*1024 {
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(10 * time.Millisecond):
+				}
+			}
+		}
+
+		n, err := nc.Read(buf)
+		if n > 0 {
+			pkt, eerr := r.crypto.Encrypt(tunnelcrypto.CmdData, connID, buf[:n])
+			if eerr == nil {
+				if !r.sendPacket(pkt) {
+					break
+				}
+			}
+		}
+		if err != nil {
+			if err != io.EOF && !errors.Is(err, net.ErrClosed) && ctx.Err() == nil {
+				log.Printf("[Tunnel Relay] Target socket closed or error #%d: %v", connID, err)
+			}
+			break
+		}
+	}
+
+	r.mu.Lock()
+	c, ok := r.activeConns[connID]
+	if ok {
+		delete(r.activeConns, connID)
+	}
+	r.mu.Unlock()
+	if ok {
+		c.cancel()
+		_ = c.nc.Close()
+	}
+
+	if ctx.Err() == nil {
+		if pkt, eerr := r.crypto.Encrypt(tunnelcrypto.CmdClose, connID, nil); eerr == nil {
+			log.Printf("[Tunnel Relay TX] Sending CLOSE #%d", connID)
+			r.sendPacket(pkt)
+		}
+	}
+}
+
+func portToString(p uint16) string {
+	const digits = "0123456789"
+	if p == 0 {
+		return "0"
+	}
+	var b [5]byte
+	i := len(b)
+	for p > 0 {
+		i--
+		b[i] = digits[p%10]
+		p /= 10
+	}
+	return string(b[i:])
+}

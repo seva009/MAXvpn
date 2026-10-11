@@ -1,0 +1,10 @@
+{
+  "callee_id": 0,
+  "token": "YOUR_CALLER_AUTH_TOKEN",
+  "private_key": "YOUR_CALLER_X25519_PRIVATE_KEY_HEX",
+  "peer_public_key": "PI_RELAY_X25519_PUBLIC_KEY_HEX",
+  "proxy_host": "127.0.0.1",
+  "proxy_port": 1080,
+  "mode": "proxy",
+  "audio_only": false
+}

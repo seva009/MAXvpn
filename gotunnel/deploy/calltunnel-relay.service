@@ -1,0 +1,17 @@
+[Unit]
+Description=Call tunnel relay (OneMe WebRTC callee)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=calltunnel
+WorkingDirectory=/opt/calltunnel
+ExecStart=/opt/calltunnel/calltunnel-relay -config /opt/calltunnel/config.json
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/opt/calltunnel
+
+[Install]
+WantedBy=multi-user.target
