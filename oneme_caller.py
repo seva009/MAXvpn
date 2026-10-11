@@ -165,84 +165,111 @@ class OneMeCaller:
                 recv_task.cancel()
                 return
 
-            # Step 3: Initiate call (Opcode 78)
-            if self.priv_key and self.peer_pub_key:
-                conversation_id = compute_knock_uuid(self.priv_key, self.peer_pub_key)
-                logger.info(f"[Auth] Generated authenticated Call Knock conversationId: {conversation_id}")
-            else:
-                conversation_id = str(uuid.uuid4())
+            # Auto-redial loop: TURN credentials from OkCDN are time-limited.
+            # When they expire, the tunnel stalls and the session terminates
+            # cleanly. We automatically place a fresh call to get new TURN
+            # credentials and resume the tunnel.
+            redial_delay = 2.0  # seconds between redials
+            while True:
+                # Step 3: Initiate call (Opcode 78)
+                if self.priv_key and self.peer_pub_key:
+                    conversation_id = compute_knock_uuid(self.priv_key, self.peer_pub_key)
+                    logger.info(f"[Auth] Generated authenticated Call Knock conversationId: {conversation_id}")
+                else:
+                    conversation_id = str(uuid.uuid4())
 
-            internal_params = json.dumps({
-                "deviceId": self.device_id,
-                "sdkVersion": "2.8.13-beta.6",
-                "clientAppKey": "",
-                "platform": "WEB",
-                "protocolVersion": 5,
-                "domainId": "",
-                "capabilities": "6A03F"
-            })
+                internal_params = json.dumps({
+                    "deviceId": self.device_id,
+                    "sdkVersion": "2.8.13-beta.6",
+                    "clientAppKey": "",
+                    "platform": "WEB",
+                    "protocolVersion": 5,
+                    "domainId": "",
+                    "capabilities": "6A03F"
+                })
 
-            logger.info(f"Calling user ID {self.callee_id} (isVideo={self.is_video}, conversationId: {conversation_id})...")
-            call_res = await self.send_cmd(oneme_proto.OPCODE_START_CALL, {
-                "conversationId": conversation_id,
-                "calleeIds": [int(self.callee_id)],
-                "internalParams": internal_params,
-                "isVideo": self.is_video
-            })
+                logger.info(f"Calling user ID {self.callee_id} (isVideo={self.is_video}, conversationId: {conversation_id})...")
+                try:
+                    call_res = await self.send_cmd(oneme_proto.OPCODE_START_CALL, {
+                        "conversationId": conversation_id,
+                        "calleeIds": [int(self.callee_id)],
+                        "internalParams": internal_params,
+                        "isVideo": self.is_video
+                    })
+                except Exception as e:
+                    logger.error(f"Failed to start call: {e}")
+                    logger.info(f"[Auto-Redial] Retrying in {redial_delay}s...")
+                    await asyncio.sleep(redial_delay)
+                    continue
 
-            if not call_res:
-                logger.error("No response received for opcode 78!")
-                recv_task.cancel()
-                return
+                if not call_res:
+                    logger.error("No response received for opcode 78!")
+                    recv_task.cancel()
+                    return
 
-            rejected = call_res.get("rejectedParticipants", [])
-            if rejected:
-                logger.error(f"Call was rejected by server: {rejected}")
-                recv_task.cancel()
-                return
+                rejected = call_res.get("rejectedParticipants", [])
+                if rejected:
+                    logger.error(f"Call was rejected by server: {rejected}")
+                    recv_task.cancel()
+                    return
 
-            internal_caller_params_raw = call_res.get("internalCallerParams")
-            if not internal_caller_params_raw:
-                logger.error(f"Missing internalCallerParams in response: {call_res}")
-                recv_task.cancel()
-                return
+                internal_caller_params_raw = call_res.get("internalCallerParams")
+                if not internal_caller_params_raw:
+                    logger.error(f"Missing internalCallerParams in response: {call_res}")
+                    recv_task.cancel()
+                    return
 
-            caller_params = json.loads(internal_caller_params_raw)
-            endpoint = caller_params.get("endpoint", "")
-            logger.info(f"Call initiated successfully! Endpoint: {endpoint[:80]}...")
+                caller_params = json.loads(internal_caller_params_raw)
+                endpoint = caller_params.get("endpoint", "")
+                logger.info(f"Call initiated successfully! Endpoint: {endpoint[:80]}...")
 
-            # Extract OK user ID and call token from endpoint URL
-            parsed_query = parse_qs(urlparse(endpoint).query)
-            ok_user_id = parsed_query.get("userId", [str(self.viewer_id)])[0]
-            call_token = parsed_query.get("token", [""])[0]
+                # Extract OK user ID and call token from endpoint URL
+                parsed_query = parse_qs(urlparse(endpoint).query)
+                ok_user_id = parsed_query.get("userId", [str(self.viewer_id)])[0]
+                call_token = parsed_query.get("token", [""])[0]
 
-            logger.info(f"Connecting to WebRTC media as caller (OkCDN userId: {ok_user_id})...")
+                logger.info(f"Connecting to WebRTC media as caller (OkCDN userId: {ok_user_id})...")
 
-            # Step 4: WebRTC caller signaling and DataChannel
-            webrtc_session = OKWebRTCSignaling(
-                user_id=ok_user_id,
-                conv_id=conversation_id,
-                token=call_token,
-                is_caller=True,
-                remote_participant_id=str(self.callee_id),
-                vcp_params=caller_params,
-                speed_test_duration=self.speed_test_duration,
-                speed_test_direction=self.speed_test_direction,
-                is_video=self.is_video,
-                mode=self.mode,
-                proxy_host=self.proxy_host,
-                proxy_port=self.proxy_port,
-                tunnel_secret=self.tunnel_secret,
-                private_key=self.private_key_str,
-                peer_public_key=self.peer_public_key_str
-            )
+                # Step 4: WebRTC caller signaling and DataChannel
+                webrtc_session = OKWebRTCSignaling(
+                    user_id=ok_user_id,
+                    conv_id=conversation_id,
+                    token=call_token,
+                    is_caller=True,
+                    remote_participant_id=str(self.callee_id),
+                    vcp_params=caller_params,
+                    speed_test_duration=self.speed_test_duration,
+                    speed_test_direction=self.speed_test_direction,
+                    is_video=self.is_video,
+                    mode=self.mode,
+                    proxy_host=self.proxy_host,
+                    proxy_port=self.proxy_port,
+                    tunnel_secret=self.tunnel_secret,
+                    private_key=self.private_key_str,
+                    peer_public_key=self.peer_public_key_str
+                )
 
-            try:
-                # Wait for call negotiation and running tunnel/test
-                await webrtc_session.run()
-                logger.info("Caller session finished!")
-            finally:
-                recv_task.cancel()
+                try:
+                    # Wait for call negotiation and running tunnel/test
+                    await webrtc_session.run()
+                except Exception as e:
+                    logger.error(f"WebRTC session error: {e}", exc_info=True)
+
+                # In speedtest mode, don't redial — the test is done.
+                if self.mode != "proxy":
+                    logger.info("Caller session finished!")
+                    break
+
+                # In proxy mode, auto-redial with fresh TURN credentials.
+                logger.info(
+                    f"\n{'='*70}\n"
+                    f"[Auto-Redial] Session ended (TURN credentials expired). "
+                    f"Redialing in {redial_delay}s with fresh credentials...\n"
+                    f"{'='*70}"
+                )
+                await asyncio.sleep(redial_delay)
+
+            recv_task.cancel()
 
     async def _recv_loop(self):
         try:

@@ -48,6 +48,7 @@ type Client struct {
 	mu      sync.Mutex
 	seq     int16
 	pending map[int16]chan result
+	dead    chan struct{} // closed when the gateway read loop exits
 }
 
 type result struct {
@@ -92,6 +93,7 @@ func New(cfg Config) *Client {
 		privKey:      priv,
 		allowedPeers: allowed,
 		pending:      map[int16]chan result{},
+		dead:         make(chan struct{}),
 	}
 }
 
@@ -195,11 +197,19 @@ func (c *Client) Run(ctx context.Context) error {
 	}
 	log.Printf("Logged in successfully as '%s' (ID: %d)! Listening for incoming calls...", name, c.viewerID)
 
-	<-ctx.Done()
-	return nil
+	// Previously this only waited for ctx.Done(): if the gateway websocket
+	// dropped, the process stayed alive but deaf (no more incoming calls, no
+	// error). Return so a supervisor (systemd Restart=always) can reconnect.
+	select {
+	case <-ctx.Done():
+		return nil
+	case <-c.dead:
+		return fmt.Errorf("gateway connection lost")
+	}
 }
 
 func (c *Client) recvLoop(ctx context.Context) {
+	defer close(c.dead)
 	for {
 		_, raw, err := c.ws.ReadMessage()
 		if err != nil {

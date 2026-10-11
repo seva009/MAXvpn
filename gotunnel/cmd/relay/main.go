@@ -14,8 +14,10 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 
 	"calltunnel/internal/callclient"
+	"calltunnel/internal/logx"
 	"calltunnel/internal/tunnelcrypto"
 )
 
@@ -31,7 +33,8 @@ func loadOrCreate(path string) callclient.Config {
 	if data, err := os.ReadFile(path); err == nil {
 		var cfg callclient.Config
 		if err := json.Unmarshal(data, &cfg); err != nil {
-			log.Fatalf("bad config %s: %v", path, err)
+			fmt.Fprintf(os.Stderr, "bad config %s: %v\n", path, err)
+			os.Exit(1)
 		}
 		if cfg.DeviceID == "" {
 			cfg.DeviceID = newUUID()
@@ -65,6 +68,9 @@ func main() {
 	}
 
 	log.SetFlags(log.Ldate | log.Ltime)
+	// Never let a slow/stuck log sink (journald, ssh, pipe) block the data path.
+	logOut := logx.NewNonBlocking(os.Stderr, 4096)
+	log.SetOutput(logOut)
 	cfg := loadOrCreate(*cfgPath)
 	if *secret != "" {
 		cfg.TunnelSecret = *secret
@@ -86,7 +92,10 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	if err := callclient.New(cfg).Run(ctx); err != nil {
-		log.Fatalf("%v", err)
+		log.Printf("%v", err)
+		logOut.Flush(2 * time.Second)
+		os.Exit(1)
 	}
 	log.Println("Terminated by user.")
+	logOut.Flush(2 * time.Second)
 }

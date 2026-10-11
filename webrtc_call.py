@@ -141,6 +141,94 @@ def _debug_t3_expired(self):
     return _orig_t3_expired(self)
 RTCSctpTransport._t3_expired = _debug_t3_expired
 
+# 3b. Patch aiortc InboundStream.pop_messages to handle out-of-order SSNs without deadlock
+from aiortc.rtcsctptransport import InboundStream
+from aiortc.utils import uint16_add
+
+def _custom_inbound_pop_messages(self):
+    """Robust pop_messages for aiortc InboundStream.
+
+    Standard aiortc InboundStream.pop_messages breaks immediately if
+    reassembly[0] has stream_seq > self.sequence_number. If sender
+    goroutines queue messages slightly out-of-order, or during bursty
+    retransmissions, reassembly[0] can hold SSN N+1 while SSN N is at
+    reassembly[1]. Standard pop_messages permanently deadlocks, leaking
+    _advertised_rwnd until it hits 0 and completely stalling the DataChannel.
+
+    This robust implementation scans for the expected sequence_number
+    anywhere in reassembly, reassembles all fragments, and yields in order.
+    """
+    while True:
+        # Check unordered messages first
+        unordered_popped = False
+        pos = 0
+        while pos < len(self.reassembly):
+            chunk = self.reassembly[pos]
+            if chunk.flags & 0x04:  # SCTP_DATA_UNORDERED
+                if chunk.flags & 0x02:  # FIRST_FRAG
+                    expected_tsn = chunk.tsn
+                    frag_end = pos
+                    complete = False
+                    while frag_end < len(self.reassembly):
+                        fchunk = self.reassembly[frag_end]
+                        if fchunk.tsn != expected_tsn:
+                            break
+                        if fchunk.flags & 0x01:  # LAST_FRAG
+                            complete = True
+                            break
+                        expected_tsn = (expected_tsn + 1) % (2**32)
+                        frag_end += 1
+                    if complete:
+                        user_data = b"".join([c.user_data for c in self.reassembly[pos : frag_end + 1]])
+                        sid, proto = chunk.stream_id, chunk.protocol
+                        self.reassembly = self.reassembly[:pos] + self.reassembly[frag_end + 1:]
+                        unordered_popped = True
+                        yield (sid, proto, user_data)
+                        break
+            pos += 1
+        if unordered_popped:
+            continue
+
+        # Look for the next ordered message with self.sequence_number
+        target_seq = self.sequence_number
+        start_idx = None
+        for i, c in enumerate(self.reassembly):
+            if not (c.flags & 0x04) and c.stream_seq == target_seq:
+                if c.flags & 0x02:  # FIRST_FRAG
+                    start_idx = i
+                    break
+
+        if start_idx is None:
+            # Expected sequence number message has not arrived or started yet
+            break
+
+        # Check if all fragments up to LAST_FRAG are present consecutively by TSN
+        expected_tsn = self.reassembly[start_idx].tsn
+        end_idx = start_idx
+        is_complete = False
+        while end_idx < len(self.reassembly):
+            fchunk = self.reassembly[end_idx]
+            if fchunk.tsn != expected_tsn:
+                break
+            if fchunk.flags & 0x01:  # LAST_FRAG
+                is_complete = True
+                break
+            expected_tsn = (expected_tsn + 1) % (2**32)
+            end_idx += 1
+
+        if not is_complete:
+            # Missing fragments, wait for arrival / retransmission
+            break
+
+        chunk = self.reassembly[start_idx]
+        user_data = b"".join([c.user_data for c in self.reassembly[start_idx : end_idx + 1]])
+        sid, proto = chunk.stream_id, chunk.protocol
+        self.reassembly = self.reassembly[:start_idx] + self.reassembly[end_idx + 1:]
+        self.sequence_number = uint16_add(self.sequence_number, 1)
+        yield (sid, proto, user_data)
+
+InboundStream.pop_messages = _custom_inbound_pop_messages
+
 # 4. Patch aioice Candidate.can_pair_with to prevent TURN 403 Forbidden IP on private IPs
 import ipaddress
 from aioice.candidate import Candidate
@@ -540,6 +628,7 @@ class OKWebRTCSignaling:
             logger.debug(f"[WebRTC DataChannel text RX] {message}")
 
     async def _proxy_keepalive_loop(self):
+        """Keepalive loop sending ping over DataChannel and WebSocket every 15s."""
         try:
             while not self.done_event.is_set():
                 await asyncio.sleep(15.0)

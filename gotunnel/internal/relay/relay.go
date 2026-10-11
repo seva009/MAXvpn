@@ -14,6 +14,7 @@ import (
 	"log"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"calltunnel/internal/tunnelcrypto"
@@ -45,6 +46,31 @@ type TunnelRelay struct {
 	mu                sync.Mutex
 	activeConns       map[uint32]*conn
 	running           bool
+
+	rxPackets atomic.Uint64
+	txPackets atomic.Uint64
+	rxBytes   atomic.Uint64
+	txBytes   atomic.Uint64
+}
+
+// Stats returns cumulative packet/byte counters (DataChannel level, encrypted
+// size) and the number of currently open target connections. Used for
+// diagnostics only.
+func (r *TunnelRelay) Stats() (rxPkts, txPkts, rxBytes, txBytes uint64, conns int) {
+	r.mu.Lock()
+	conns = len(r.activeConns)
+	r.mu.Unlock()
+	return r.rxPackets.Load(), r.txPackets.Load(), r.rxBytes.Load(), r.txBytes.Load(), conns
+}
+
+// send wraps sendPacket with accounting.
+func (r *TunnelRelay) send(pkt []byte) bool {
+	ok := r.sendPacket(pkt)
+	if ok {
+		r.txPackets.Add(1)
+		r.txBytes.Add(uint64(len(pkt)))
+	}
+	return ok
 }
 
 // New constructs a TunnelRelay, mirroring TunnelRelay.__init__.
@@ -77,6 +103,8 @@ func (r *TunnelRelay) Stop() {
 // HandleChannelPacket mirrors TunnelRelay.handle_channel_packet: called
 // whenever an encrypted packet arrives from the caller via the DataChannel.
 func (r *TunnelRelay) HandleChannelPacket(raw []byte) {
+	r.rxPackets.Add(1)
+	r.rxBytes.Add(uint64(len(raw)))
 	msgType, connID, payload, err := r.crypto.Decrypt(raw)
 	if err != nil {
 		log.Printf("[Tunnel Relay RX] Failed to decrypt packet: %v", err)
@@ -89,12 +117,23 @@ func (r *TunnelRelay) HandleChannelPacket(raw []byte) {
 		if uerr != nil {
 			log.Printf("[Tunnel Relay] Error unpacking connect payload #%d: %v", connID, uerr)
 			if pkt, eerr := r.crypto.Encrypt(tunnelcrypto.CmdConnectFail, connID, []byte(uerr.Error())); eerr == nil {
-				r.sendPacket(pkt)
+				r.send(pkt)
 			}
 			return
 		}
 		log.Printf("[Tunnel Relay RX] CONNECT request #%d -> %s:%d", connID, host, port)
 		go r.handleConnect(connID, host, port)
+
+	case tunnelcrypto.CmdPing:
+		// The protocol defines an encrypted PING/PONG ([conn_id][timestamp]),
+		// but it used to fall through this switch unanswered, so a caller
+		// that uses it as a liveness probe saw a dead tunnel. Echo it back.
+		if pkt, eerr := r.crypto.Encrypt(tunnelcrypto.CmdPong, connID, payload); eerr == nil {
+			r.send(pkt)
+		}
+
+	case tunnelcrypto.CmdPong:
+		// nothing to do
 
 	case tunnelcrypto.CmdData:
 		r.mu.Lock()
@@ -104,8 +143,27 @@ func (r *TunnelRelay) HandleChannelPacket(raw []byte) {
 			select {
 			case c.writeChan <- payload:
 			default:
-				// Decoupled write buffer to prevent blocking Pion's OnMessage loop
-				log.Printf("[Tunnel Relay] Target conn #%d write buffer full, dropping packet", connID)
+				// Never block Pion's OnMessage loop (it serves every
+				// connection and the keepalive). But silently dropping a
+				// chunk of a TCP byte stream corrupts it and leaves the
+				// application hanging forever (TLS/HTTP just stop). Fail
+				// loudly instead: reset this one connection so the client
+				// gets a clean error and can retry.
+				log.Printf("[Tunnel Relay] Target conn #%d write buffer full, resetting connection", connID)
+				r.mu.Lock()
+				if cur, still := r.activeConns[connID]; still && cur == c {
+					delete(r.activeConns, connID)
+				} else {
+					ok = false
+				}
+				r.mu.Unlock()
+				if ok {
+					c.cancel()
+					_ = c.nc.Close()
+					if pkt, eerr := r.crypto.Encrypt(tunnelcrypto.CmdClose, connID, nil); eerr == nil {
+						r.send(pkt)
+					}
+				}
 			}
 		}
 
@@ -158,7 +216,7 @@ func (r *TunnelRelay) handleConnect(connID uint32, host string, port uint16) {
 		log.Printf("[Tunnel Relay] Failed to connect to %s:%d for conn #%d: %v", host, port, connID, err)
 		if pkt, eerr := r.crypto.Encrypt(tunnelcrypto.CmdConnectFail, connID, []byte(err.Error())); eerr == nil {
 			log.Printf("[Tunnel Relay TX] Sending CONNECT_FAIL #%d", connID)
-			r.sendPacket(pkt)
+			r.send(pkt)
 		}
 		return
 	}
@@ -188,7 +246,7 @@ func (r *TunnelRelay) handleConnect(connID uint32, host string, port uint16) {
 
 	if pkt, eerr := r.crypto.Encrypt(tunnelcrypto.CmdConnectOK, connID, nil); eerr == nil {
 		log.Printf("[Tunnel Relay TX] Sending CONNECT_OK #%d", connID)
-		r.sendPacket(pkt)
+		r.send(pkt)
 	}
 }
 
@@ -219,7 +277,7 @@ func (r *TunnelRelay) remoteReaderLoop(ctx context.Context, connID uint32, nc ne
 		if n > 0 {
 			pkt, eerr := r.crypto.Encrypt(tunnelcrypto.CmdData, connID, buf[:n])
 			if eerr == nil {
-				if !r.sendPacket(pkt) {
+				if !r.send(pkt) {
 					break
 				}
 			}
@@ -246,7 +304,7 @@ func (r *TunnelRelay) remoteReaderLoop(ctx context.Context, connID uint32, nc ne
 	if ctx.Err() == nil {
 		if pkt, eerr := r.crypto.Encrypt(tunnelcrypto.CmdClose, connID, nil); eerr == nil {
 			log.Printf("[Tunnel Relay TX] Sending CLOSE #%d", connID)
-			r.sendPacket(pkt)
+			r.send(pkt)
 		}
 	}
 }

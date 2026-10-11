@@ -117,14 +117,23 @@ func (a *allocation) refreshPermissions() error {
 		a.log.Debug("No permission to refresh")
 		return nil
 	}
-	if err := a.CreatePermissions(addrs...); err != nil {
-		if errors.Is(err, errTryAgain) {
-			return errTryAgain
+	successCount := 0
+	var lastErr error
+	for _, addr := range addrs {
+		if err := a.CreatePermissions(addr); err != nil {
+			if errors.Is(err, errTryAgain) {
+				return errTryAgain
+			}
+			lastErr = err
+		} else {
+			successCount++
 		}
-		a.log.Errorf("Fail to refresh permissions: %s", err)
-		return err
 	}
-	a.log.Debug("Refresh permissions successful")
+	if successCount == 0 && lastErr != nil {
+		a.log.Errorf("Fail to refresh permissions: %s", lastErr)
+		return lastErr
+	}
+	a.log.Debugf("Refresh permissions successful (%d/%d refreshed)", successCount, len(addrs))
 	return nil
 }
 

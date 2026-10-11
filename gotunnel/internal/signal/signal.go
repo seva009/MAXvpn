@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"log"
 	"net/url"
+	"os"
 	"regexp"
 	"strconv"
 	"strings"
@@ -25,6 +26,7 @@ import (
 	"github.com/pion/logging"
 	"github.com/pion/webrtc/v3"
 
+	"calltunnel/internal/logx"
 	"calltunnel/internal/relay"
 	"calltunnel/internal/tunnelcrypto"
 )
@@ -56,6 +58,7 @@ type Session struct {
 	remotePID     string
 	pc            *webrtc.PeerConnection
 	dc            *webrtc.DataChannel
+	dcSendMu      sync.Mutex
 	tunnel        *relay.TunnelRelay
 	responder     *tunnelcrypto.HandshakeResponder
 	watchdogTimer *time.Timer
@@ -97,13 +100,15 @@ func New(cfg Config) (*Session, error) {
 		return nil, err
 	}
 	se := webrtc.SettingEngine{}
+	// pion logs go through a non-blocking writer to stderr. Previously the
+	// "sctp"/"datachannel"/"ortc" scopes were at Debug and wrote synchronously
+	// to stdout: once stdout became slow, pion/sctp's read/write loops blocked
+	// inside the logger and the tunnel silently stopped moving packets while
+	// ICE/DTLS still looked healthy. Default is Warn; to debug, set e.g.
+	// PION_LOG_DEBUG=sctp in the environment (pion reads it itself).
 	loggerFactory := logging.NewDefaultLoggerFactory()
+	loggerFactory.Writer = logx.NewNonBlocking(os.Stderr, 4096)
 	loggerFactory.DefaultLogLevel = logging.LogLevelWarn
-	loggerFactory.ScopeLevels = map[string]logging.LogLevel{
-		"sctp":        logging.LogLevelDebug,
-		"datachannel": logging.LogLevelDebug,
-		"ortc":        logging.LogLevelDebug,
-	}
 	se.LoggerFactory = loggerFactory
 	api := webrtc.NewAPI(webrtc.WithMediaEngine(me), webrtc.WithSettingEngine(se))
 	pc, err := api.NewPeerConnection(webrtc.Configuration{ICEServers: servers})
@@ -144,7 +149,15 @@ func str(v interface{}) string {
 func (s *Session) finish() { s.doneOnce.Do(func() { close(s.done) }) }
 
 // sendChannelBytes mirrors send_channel_bytes.
+// We serialize all DataChannel sends with dcSendMu: if multiple goroutines
+// (e.g. concurrent target readers during heavy browsing/video streaming)
+// call dc.Send in parallel, pion/sctp's packetize (which assigns streamSequenceNumber)
+// and sendPayloadData (which assigns TSN) can be interleaved, leading to chunks
+// where TSN order is inverted relative to SSN order.
 func (s *Session) sendChannelBytes(data []byte) bool {
+	s.dcSendMu.Lock()
+	defer s.dcSendMu.Unlock()
+
 	s.mu.Lock()
 	dc := s.dc
 	s.mu.Unlock()
@@ -431,10 +444,15 @@ func (s *Session) Run(ctx context.Context) error {
 	return nil
 }
 
-// keepalive mirrors _proxy_keepalive_loop (15 s).
+// keepalive mirrors _proxy_keepalive_loop (15 s) and additionally logs a
+// one-line health summary every 5 s, reporting ICE/DTLS state, DataChannel
+// state, SCTP buffer queue, and bidirectional packet/byte counters.
 func (s *Session) keepalive(stop chan struct{}) {
-	tk := time.NewTicker(15 * time.Second)
+	tk := time.NewTicker(5 * time.Second)
 	defer tk.Stop()
+	var tick int
+	var lastRx, lastTx uint64
+	var stallCount int
 	for {
 		select {
 		case <-stop:
@@ -442,16 +460,36 @@ func (s *Session) keepalive(stop chan struct{}) {
 		case <-s.done:
 			return
 		case <-tk.C:
+			tick++
 			s.mu.Lock()
-			dc, ws := s.dc, s.ws
+			dc, ws, tunnel := s.dc, s.ws, s.tunnel
 			s.mu.Unlock()
-			if dc != nil && dc.ReadyState() == webrtc.DataChannelStateOpen {
-				_ = dc.SendText("ping")
+
+			if tick%3 == 0 { // every 15 s, as before
+				if dc != nil && dc.ReadyState() == webrtc.DataChannelStateOpen {
+					_ = dc.SendText("ping")
+				}
+				if ws != nil {
+					s.wsWriteMu.Lock()
+					_ = ws.WriteControl(websocket.PingMessage, []byte{}, time.Now().Add(5*time.Second))
+					s.wsWriteMu.Unlock()
+				}
 			}
-			if ws != nil {
-				s.wsWriteMu.Lock()
-				_ = ws.WriteControl(websocket.PingMessage, []byte{}, time.Now().Add(5*time.Second))
-				s.wsWriteMu.Unlock()
+
+			if tunnel != nil && dc != nil {
+				rxP, txP, rxB, txB, conns := tunnel.Stats()
+				log.Printf("[Health] ice=%s conn=%s dc=%s conns=%d buffered=%dB rx=%dpkt/%dB tx=%dpkt/%dB (+%dB rx, +%dB tx in 5s)",
+					s.pc.ICEConnectionState(), s.pc.ConnectionState(), dc.ReadyState(), conns,
+					dc.BufferedAmount(), rxP, rxB, txP, txB, rxB-lastRx, txB-lastTx)
+				if conns > 0 && rxB == lastRx && txB == lastTx && tick > 1 {
+					stallCount++
+					if stallCount%3 == 0 {
+						log.Printf("[Health] NOTICE: %d open connection(s) idle (%ds)", conns, stallCount*5)
+					}
+				} else {
+					stallCount = 0
+				}
+				lastRx, lastTx = rxB, txB
 			}
 		}
 	}
