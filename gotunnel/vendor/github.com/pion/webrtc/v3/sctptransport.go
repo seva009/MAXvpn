@@ -449,3 +449,8 @@ func (r *SCTPTransport) association() *sctp.Association {
 	r.lock.RUnlock()
 	return association
 }
+
+// Association returns the underlying SCTP association.
+func (r *SCTPTransport) Association() *sctp.Association {
+	return r.association()
+}

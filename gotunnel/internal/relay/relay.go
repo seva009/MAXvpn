@@ -20,9 +20,9 @@ import (
 	"calltunnel/internal/tunnelcrypto"
 )
 
-// ChunkSize mirrors CHUNK_SIZE in tunnel_relay.py / socks5_server.py (4 KB
+// ChunkSize mirrors CHUNK_SIZE in tunnel_relay.py / socks5_server.py (16 KB
 // WebRTC DataChannel frame size for reduced SCTP packet loss and lower latency).
-const ChunkSize = 4096
+const ChunkSize = 16384
 
 // SendPacketFunc matches the Python send_packet_fn callable: it hands an
 // already-encrypted packet to the DataChannel for transmission. Returns true
@@ -264,11 +264,11 @@ func (r *TunnelRelay) remoteReaderLoop(ctx context.Context, connID uint32, nc ne
 
 		// Backpressure: pause reading from target if outbound DataChannel SCTP buffer is full
 		if r.getBufferedAmount != nil {
-			for r.getBufferedAmount() > 512*1024 {
+			for r.getBufferedAmount() > 2*1024*1024 {
 				select {
 				case <-ctx.Done():
 					return
-				case <-time.After(10 * time.Millisecond):
+				case <-time.After(1 * time.Millisecond):
 				}
 			}
 		}

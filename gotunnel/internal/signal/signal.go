@@ -142,6 +142,7 @@ func New(cfg Config) (*Session, error) {
 	se := webrtc.SettingEngine{}
 	se.SetNet(netx.NewPionNet())
 	se.SetICEMulticastDNSMode(ice.MulticastDNSModeDisabled)
+	se.SetSCTPMaxReceiveBufferSize(4 * 1024 * 1024)
 	loggerFactory := logging.NewDefaultLoggerFactory()
 	loggerFactory.Writer = logx.NewNonBlocking(os.Stderr, 4096)
 	loggerFactory.DefaultLogLevel = logging.LogLevelWarn
@@ -643,20 +644,28 @@ func (s *Session) keepalive(stop chan struct{}) {
 				}
 			}
 
+			var sctpStats string
+			if sctpTransport := s.pc.SCTP(); sctpTransport != nil {
+				if assoc := sctpTransport.Association(); assoc != nil {
+					sctpStats = fmt.Sprintf(" cwnd=%d rwnd=%d srtt=%.1fms inflight=%d pending=%d",
+						assoc.CWND(), assoc.RWND(), assoc.SRTT(), assoc.InflightBytes(), assoc.PendingBytes())
+				}
+			}
+
 			if s.cfg.IsCaller {
 				if srv != nil && dc != nil {
 					rxP, txP, rxB, txB, conns := srv.Stats()
-					log.Printf("[Health] ice=%s conn=%s dc=%s conns=%d buffered=%dB rx=%dpkt/%dB tx=%dpkt/%dB (+%dB rx, +%dB tx in 5s)",
+					log.Printf("[Health] ice=%s conn=%s dc=%s conns=%d buffered=%dB%s rx=%dpkt/%dB tx=%dpkt/%dB (+%dB rx, +%dB tx in 5s)",
 						s.pc.ICEConnectionState(), s.pc.ConnectionState(), dc.ReadyState(), conns,
-						dc.BufferedAmount(), rxP, rxB, txP, txB, rxB-lastRx, txB-lastTx)
+						dc.BufferedAmount(), sctpStats, rxP, rxB, txP, txB, rxB-lastRx, txB-lastTx)
 					lastRx, lastTx = rxB, txB
 				}
 			} else {
 				if tunnel != nil && dc != nil {
 					rxP, txP, rxB, txB, conns := tunnel.Stats()
-					log.Printf("[Health] ice=%s conn=%s dc=%s conns=%d buffered=%dB rx=%dpkt/%dB tx=%dpkt/%dB (+%dB rx, +%dB tx in 5s)",
+					log.Printf("[Health] ice=%s conn=%s dc=%s conns=%d buffered=%dB%s rx=%dpkt/%dB tx=%dpkt/%dB (+%dB rx, +%dB tx in 5s)",
 						s.pc.ICEConnectionState(), s.pc.ConnectionState(), dc.ReadyState(), conns,
-						dc.BufferedAmount(), rxP, rxB, txP, txB, rxB-lastRx, txB-lastTx)
+						dc.BufferedAmount(), sctpStats, rxP, rxB, txP, txB, rxB-lastRx, txB-lastTx)
 					if conns > 0 && rxB == lastRx && txB == lastTx && tick > 1 {
 						stallCount++
 						if stallCount%3 == 0 {

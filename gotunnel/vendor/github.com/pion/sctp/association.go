@@ -56,7 +56,7 @@ var (
 const (
 	receiveMTU            uint32 = 8192 // MTU for inbound packet (from DTLS)
 	initialMTU            uint32 = 1228 // initial MTU for outgoing packets (to DTLS)
-	initialRecvBufSize    uint32 = 1024 * 1024
+	initialRecvBufSize    uint32 = 4 * 1024 * 1024
 	commonHeaderSize      uint32 = 12
 	dataChunkHeaderSize   uint32 = 16
 	defaultMaxMessageSize uint32 = 65536
@@ -324,6 +324,7 @@ func createAssociation(config Config) *Association {
 		netConn:              config.NetConn,
 		maxReceiveBufferSize: maxReceiveBufferSize,
 		maxMessageSize:       maxMessageSize,
+		ackMode:              ackModeNoDelay,
 
 		// These two max values have us not need to follow
 		// 5.1.1 where this peer may be incapable of supporting
@@ -1127,7 +1128,25 @@ func (a *Association) setRWND(rwnd uint32) {
 
 // SRTT returns the latest smoothed round-trip time (srrt)
 func (a *Association) SRTT() float64 {
-	return a.srtt.Load().(float64) //nolint:forcetypeassert
+	val := a.srtt.Load()
+	if val == nil {
+		return 0
+	}
+	return val.(float64) //nolint:forcetypeassert
+}
+
+// InflightBytes returns the current number of bytes in flight.
+func (a *Association) InflightBytes() int {
+	a.lock.Lock()
+	defer a.lock.Unlock()
+	return a.inflightQueue.getNumBytes()
+}
+
+// PendingBytes returns the current number of bytes in pending queue.
+func (a *Association) PendingBytes() int {
+	a.lock.Lock()
+	defer a.lock.Unlock()
+	return a.pendingQueue.getNumBytes()
 }
 
 // getMaxTSNOffset returns the maximum offset over the current cummulative TSN that
@@ -1613,10 +1632,15 @@ func (a *Association) processSelectiveAck(d *chunkSelectiveAck) (map[uint16]int,
 			}
 		}
 
-		if a.inFastRecovery && c.tsn == a.fastRecoverExitPoint {
+		if a.inFastRecovery && sna32GTE(c.tsn, a.fastRecoverExitPoint) {
 			a.log.Debugf("[%s] exit fast-recovery", a.name)
 			a.inFastRecovery = false
 		}
+	}
+
+	if a.inFastRecovery && (sna32GTE(d.cumulativeTSNAck, a.fastRecoverExitPoint) || a.inflightQueue.size() == 0) {
+		a.log.Debugf("[%s] exit fast-recovery (cumAck=%d >= exitPoint=%d)", a.name, d.cumulativeTSNAck, a.fastRecoverExitPoint)
+		a.inFastRecovery = false
 	}
 
 	htna := d.cumulativeTSNAck
@@ -1675,6 +1699,9 @@ func (a *Association) onCumulativeTSNAckPointAdvanced(totalBytesAcked int) {
 	}
 
 	// Update congestion control parameters
+	flightSize := a.inflightQueue.getNumBytes() + totalBytesAcked
+	cwndUtilized := uint32(flightSize)+a.MTU() >= a.CWND() || a.pendingQueue.size() > 0
+
 	if a.CWND() <= a.ssthresh {
 		// RFC 4096, sec 7.2.1.  Slow-Start
 		//   o  When cwnd is less than or equal to ssthresh, an SCTP endpoint MUST
@@ -1687,15 +1714,14 @@ func (a *Association) onCumulativeTSNAckPointAdvanced(totalBytesAcked int) {
 		//      most, the lesser of 1) the total size of the previously
 		//      outstanding DATA chunk(s) acknowledged, and 2) the destination's
 		//      path MTU.
-		if !a.inFastRecovery &&
-			a.pendingQueue.size() > 0 {
+		if !a.inFastRecovery && cwndUtilized {
 			a.setCWND(a.CWND() + min32(uint32(totalBytesAcked), a.CWND()))
 			// a.cwnd += min32(uint32(totalBytesAcked), a.MTU()) // SCTP way (slow)
 			a.log.Tracef("[%s] updated cwnd=%d ssthresh=%d acked=%d (SS)",
 				a.name, a.CWND(), a.ssthresh, totalBytesAcked)
 		} else {
-			a.log.Tracef("[%s] cwnd did not grow: cwnd=%d ssthresh=%d acked=%d FR=%v pending=%d",
-				a.name, a.CWND(), a.ssthresh, totalBytesAcked, a.inFastRecovery, a.pendingQueue.size())
+			a.log.Tracef("[%s] cwnd did not grow: cwnd=%d ssthresh=%d acked=%d FR=%v inflight=%d pending=%d",
+				a.name, a.CWND(), a.ssthresh, totalBytesAcked, a.inFastRecovery, flightSize, a.pendingQueue.size())
 		}
 	} else {
 		// RFC 4096, sec 7.2.2.  Congestion Avoidance
@@ -1711,9 +1737,9 @@ func (a *Association) onCumulativeTSNAckPointAdvanced(totalBytesAcked int) {
 		//      of data outstanding (i.e., before arrival of the SACK, flight size
 		//      was greater than or equal to cwnd), increase cwnd by MTU, and
 		//      reset partial_bytes_acked to (partial_bytes_acked - cwnd).
-		if a.partialBytesAcked >= a.CWND() && a.pendingQueue.size() > 0 {
+		if a.partialBytesAcked >= a.CWND() && cwndUtilized {
 			a.partialBytesAcked -= a.CWND()
-			a.setCWND(a.CWND() + a.MTU())
+			a.setCWND(a.CWND() + min32(max32(a.CWND()/16, a.MTU()), 4*a.MTU()))
 			a.log.Tracef("[%s] updated cwnd=%d ssthresh=%d acked=%d (CA)",
 				a.name, a.CWND(), a.ssthresh, totalBytesAcked)
 		}
@@ -2631,6 +2657,7 @@ func (a *Association) onRetransmissionTimeout(id int, nRtos uint) {
 		//      ssthresh = max(cwnd/2, 4*MTU)
 		//      cwnd = 1*MTU
 
+		a.inFastRecovery = false
 		a.ssthresh = max32(a.CWND()/2, 4*a.MTU())
 		a.setCWND(a.MTU())
 		a.log.Tracef("[%s] updated cwnd=%d ssthresh=%d inflight=%d (RTO)",
