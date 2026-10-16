@@ -53,6 +53,9 @@ func main() {
 	flag.StringVar(secret, "s", "", "shorthand for -secret")
 	privKey := flag.String("privkey", "", "asymmetric private key (hex)")
 	allowedPeers := flag.String("allowed-peers", "", "comma-separated allowed caller public keys (hex)")
+	dnsServer := flag.String("dns", "", "custom DNS server (e.g. 77.88.8.8, 1.1.1.1)")
+	insecure := flag.Bool("k", false, "skip TLS certificate verification")
+	flag.BoolVar(insecure, "insecure", false, "skip TLS certificate verification")
 	genKey := flag.Bool("gen-key", false, "generate new Curve25519 (X25519) keypair and exit")
 	flag.Parse()
 
@@ -72,6 +75,12 @@ func main() {
 	logOut := logx.NewNonBlocking(os.Stderr, 4096)
 	log.SetOutput(logOut)
 	cfg := loadOrCreate(*cfgPath)
+	if *dnsServer != "" {
+		cfg.DNS = *dnsServer
+	}
+	if *insecure {
+		cfg.InsecureSkipVerify = true
+	}
 	if *secret != "" {
 		cfg.TunnelSecret = *secret
 	}
@@ -91,10 +100,26 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	if err := callclient.New(cfg).Run(ctx); err != nil {
-		log.Printf("%v", err)
-		logOut.Flush(2 * time.Second)
-		os.Exit(1)
+
+	for {
+		if ctx.Err() != nil {
+			break
+		}
+		c := callclient.New(cfg)
+		if err := c.Run(ctx); err != nil {
+			if ctx.Err() != nil {
+				break
+			}
+			log.Printf("[Relay Error] %v", err)
+			log.Println("[Relay Auto-Reconnect] Retrying in 3s...")
+			select {
+			case <-ctx.Done():
+				break
+			case <-time.After(3 * time.Second):
+			}
+		} else {
+			break
+		}
 	}
 	log.Println("Terminated by user.")
 	logOut.Flush(2 * time.Second)

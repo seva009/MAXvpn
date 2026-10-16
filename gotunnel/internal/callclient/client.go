@@ -16,6 +16,7 @@ import (
 
 	"github.com/gorilla/websocket"
 
+	"calltunnel/internal/netx"
 	"calltunnel/internal/proto"
 	"calltunnel/internal/signal"
 	"calltunnel/internal/tunnelcrypto"
@@ -35,6 +36,9 @@ type Config struct {
 	TunnelSecret string   `json:"tunnel_secret"`
 	PrivateKey   string   `json:"private_key"`
 	AllowedPeers []string `json:"allowed_peers"`
+	DNS                string   `json:"dns"`
+	InsecureSkipVerify bool     `json:"insecure_skip_verify"`
+	Insecure           bool     `json:"insecure"`
 }
 
 type Client struct {
@@ -87,6 +91,16 @@ func New(cfg Config) *Client {
 		}
 	}
 
+	var dnsList []string
+	if cfg.DNS != "" {
+		for _, d := range strings.Split(cfg.DNS, ",") {
+			if td := strings.TrimSpace(d); td != "" {
+				dnsList = append(dnsList, td)
+			}
+		}
+	}
+	netx.SetupNetwork(dnsList, cfg.InsecureSkipVerify || cfg.Insecure)
+
 	return &Client{
 		cfg:          cfg,
 		viewerID:     vid,
@@ -133,23 +147,80 @@ func (c *Client) sendCmd(opcode int16, payload interface{}) (interface{}, error)
 }
 
 // Run mirrors OneMeClient.run().
+// Run connects to the OneMe gateway and listens for incoming calls indefinitely,
+// automatically reconnecting to the gateway if the connection drops.
 func (c *Client) Run(ctx context.Context) error {
 	if c.cfg.Token == "" || c.cfg.Token == "YOUR_ONEME_AUTH_TOKEN" {
 		return fmt.Errorf("please set your real auth token in config.json (browser: localStorage.getItem('__oneme_auth'))")
 	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		default:
+		}
+
+		err := c.runSession(ctx)
+		if ctx.Err() != nil {
+			return nil
+		}
+		if err != nil {
+			log.Printf("[Relay Gateway Error] %v", err)
+		}
+		log.Println("[Auto-Reconnect] OneMe gateway disconnected. Reconnecting in 3s...")
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-time.After(3 * time.Second):
+		}
+	}
+}
+
+func (c *Client) runSession(ctx context.Context) error {
 	log.Printf("Connecting to OneMe gateway: %s...", gatewayURL)
 	hdr := http.Header{}
 	hdr.Set("Origin", "https://web.max.ru")
 	hdr.Set("User-Agent", userAgent)
-	ws, _, err := websocket.DefaultDialer.DialContext(ctx, gatewayURL, hdr)
+	dialer := *websocket.DefaultDialer
+	dialer.TLSClientConfig = netx.TLSConfig(c.cfg.InsecureSkipVerify || c.cfg.Insecure)
+	ws, _, err := dialer.DialContext(ctx, gatewayURL, hdr)
 	if err != nil {
 		return fmt.Errorf("dial gateway: %w", err)
 	}
 	defer ws.Close()
+
+	c.mu.Lock()
 	c.ws = ws
+	c.pending = make(map[int16]chan result)
+	c.dead = make(chan struct{})
+	c.mu.Unlock()
+
 	log.Println("Connected to wss://api.oneme.ru/websocket!")
 
 	go c.recvLoop(ctx)
+
+	// Keepalive ping loop: send WebSocket ping every 20s to prevent NAT/firewall idle timeouts
+	pingStop := make(chan struct{})
+	defer close(pingStop)
+	go func() {
+		ticker := time.NewTicker(20 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				c.writeMu.Lock()
+				_ = ws.WriteControl(websocket.PingMessage, []byte{}, time.Now().Add(5*time.Second))
+				c.writeMu.Unlock()
+			case <-c.dead:
+				return
+			case <-pingStop:
+				return
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
 
 	// Step 1: session init (opcode 6)
 	_, err = c.sendCmd(proto.OpcodeInit, map[string]interface{}{
@@ -197,9 +268,6 @@ func (c *Client) Run(ctx context.Context) error {
 	}
 	log.Printf("Logged in successfully as '%s' (ID: %d)! Listening for incoming calls...", name, c.viewerID)
 
-	// Previously this only waited for ctx.Done(): if the gateway websocket
-	// dropped, the process stayed alive but deaf (no more incoming calls, no
-	// error). Return so a supervisor (systemd Restart=always) can reconnect.
 	select {
 	case <-ctx.Done():
 		return nil

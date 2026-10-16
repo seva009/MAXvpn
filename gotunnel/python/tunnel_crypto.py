@@ -81,6 +81,8 @@ def compute_knock_uuid(priv_key: bytes, peer_pub_key: bytes, ts: int | None = No
     hex_str = raw.hex()
     return f"{hex_str[0:8]}-{hex_str[8:12]}-{hex_str[12:16]}-{hex_str[16:20]}-{hex_str[20:32]}"
 
+_knock_cache: dict[str, int] = {}
+
 def verify_knock_uuid(priv_key: bytes, allowed_pub_keys: list[bytes], uuid_str: str, window_sec: int = 60) -> bool:
     """Verifies whether uuid_str contains a valid knock token from any allowed peer."""
     clean = uuid_str.replace("-", "").strip()
@@ -94,6 +96,11 @@ def verify_knock_uuid(priv_key: bytes, allowed_pub_keys: list[bytes], uuid_str: 
     now = int(time.time())
     if abs(now - ts) > window_sec:
         return False
+
+    # Anti-replay check for knock UUID
+    if clean in _knock_cache and abs(now - _knock_cache[clean]) <= window_sec:
+        return False
+
     ts_bytes = raw[:4]
     priv = x25519.X25519PrivateKey.from_private_bytes(priv_key)
     for peer_pub_bytes in allowed_pub_keys:
@@ -106,6 +113,11 @@ def verify_knock_uuid(priv_key: bytes, allowed_pub_keys: list[bytes], uuid_str: 
             exp[6] = (exp[6] & 0x0f) | 0x40
             exp[8] = (exp[8] & 0x3f) | 0x80
             if hmac.compare_digest(raw, bytes(exp)):
+                _knock_cache[clean] = now
+                # Prune old cache entries
+                to_del = [k for k, v in _knock_cache.items() if now - v > window_sec * 2]
+                for k in to_del:
+                    _knock_cache.pop(k, None)
                 return True
         except Exception:
             continue
@@ -114,9 +126,10 @@ def verify_knock_uuid(priv_key: bytes, allowed_pub_keys: list[bytes], uuid_str: 
 class TunnelCrypto:
     """
     Handles AES-256-GCM authenticated encryption for tunnel packets.
-    Produces ciphertext that looks like uniform random noise (no unencrypted headers or magic bytes).
+    Uses deterministic 64-bit monotonic sequence counters in the 12-byte nonce
+    to eliminate GCM nonce collision risks and provide sliding-window anti-replay protection.
     Wire format:
-      [12-byte random Nonce] + [AES-GCM Ciphertext + 16-byte GCM Tag]
+      [12-byte Nonce: 4B prefix + 8B big-endian seq] + [AES-GCM Ciphertext + 16-byte GCM Tag]
     Plaintext inside ciphertext:
       [1-byte msg_type] + [4-byte conn_id uint32] + [payload]
     """
@@ -130,9 +143,13 @@ class TunnelCrypto:
             key = hashlib.sha256(secret.encode("utf-8")).digest()
             self.tx_aes = AESGCM(key)
             self.rx_aes = AESGCM(key)
+        self.tx_seq = 0
+        self.last_rx_seq = 0
+        self.replay_bitmap = 0
 
     def encrypt(self, msg_type: int, conn_id: int, payload: bytes = b"") -> bytes:
-        nonce = os.urandom(12)
+        self.tx_seq += 1
+        nonce = struct.pack("!IQ", 0, self.tx_seq)
         plaintext = struct.pack("!BI", msg_type, conn_id) + payload
         ciphertext = self.tx_aes.encrypt(nonce, plaintext, None)
         return nonce + ciphertext
@@ -142,7 +159,36 @@ class TunnelCrypto:
             raise ValueError(f"Packet too short for AES-GCM decrypt: {len(data)} bytes")
         nonce = data[:12]
         ciphertext = data[12:]
+        seq = struct.unpack("!Q", nonce[4:12])[0]
+
+        # 1. Anti-replay pre-check (sliding window 64)
+        if seq == 0:
+            if self.last_rx_seq > 0:
+                raise ValueError("tunnelcrypto: invalid zero sequence number")
+        elif seq <= self.last_rx_seq:
+            diff = self.last_rx_seq - seq
+            if diff >= 64:
+                raise ValueError(f"tunnelcrypto: packet too old (seq {seq}, last {self.last_rx_seq})")
+            if (self.replay_bitmap & (1 << diff)) != 0:
+                raise ValueError(f"tunnelcrypto: duplicate/replayed packet (seq {seq})")
+
+        # 2. Decrypt and authenticate
         plaintext = self.rx_aes.decrypt(nonce, ciphertext, None)
+
+        # 3. Authenticated: commit sequence number to replay window
+        if seq > 0:
+            if seq > self.last_rx_seq:
+                diff = seq - self.last_rx_seq
+                if diff < 64:
+                    self.replay_bitmap = (self.replay_bitmap << diff) | 1
+                else:
+                    self.replay_bitmap = 1
+                self.last_rx_seq = seq
+            else:
+                diff = self.last_rx_seq - seq
+                if diff < 64:
+                    self.replay_bitmap |= (1 << diff)
+
         msg_type, conn_id = struct.unpack("!BI", plaintext[:5])
         payload = plaintext[5:]
         return msg_type, conn_id, payload
@@ -205,7 +251,8 @@ class HandshakeInitiator:
         dh3 = e_priv.exchange(relay_e_pub)
         dh4 = priv.exchange(relay_e_pub)
 
-        ikm_resp = dh3 + dh4
+        # Full DH binding: dh1 + dh2 + dh3 + dh4 ensures mutual proof of static keys
+        ikm_resp = self.dh1 + self.dh2 + dh3 + dh4
         salt_resp = self.ephemeral_pub + e_relay
         k_resp = hkdf_sha256(ikm_resp, salt_resp, b"calltunnel-resp", 32)
 
@@ -267,7 +314,8 @@ class HandshakeResponder:
         dh3 = e_priv.exchange(caller_e_pub)
         dh4 = e_priv.exchange(x25519.X25519PublicKey.from_public_bytes(caller_pub))
 
-        ikm_resp = dh3 + dh4
+        # Full DH binding: dh1 + dh2 + dh3 + dh4 ensures mutual proof of static keys
+        ikm_resp = dh1 + dh2 + dh3 + dh4
         salt_resp = e_caller + e_pub_bytes
         k_resp = hkdf_sha256(ikm_resp, salt_resp, b"calltunnel-resp", 32)
         nonce3 = os.urandom(12)

@@ -374,6 +374,14 @@ def main():
     audio_only = args.audio_only if args.audio_only else cfg.get("audio_only", False)
     is_video = not audio_only
 
+    if not priv_key or not peer_pub_key:
+        logger.warning("[SECURITY WARNING] No X25519 private key or relay public key configured!")
+        logger.warning("[SECURITY WARNING] Running in PSK fallback mode without cryptographic relay identity verification.")
+        logger.warning("[SECURITY WARNING] Man-in-the-middle verification is disabled.")
+        logger.warning("[SECURITY WARNING] To generate a keypair, run: python3 oneme_caller.py --gen-key")
+    if secret == "oneme_webrtc_aes_tunnel_key":
+        logger.warning("[SECURITY ALERT] Using default hardcoded tunnel secret! Change 'tunnel_secret' in config_caller.json or specify -s <secret>.")
+
     caller = OneMeCaller(
         token=token,
         device_id=device_id,

@@ -12,27 +12,28 @@
                  │ SOCKS5 (127.0.0.1:1080)
                  ▼
      ┌───────────────────────┐                               ┌───────────────────────┐
-     │      CALLER (ПК)      │   Звонок OneMe через OkCDN    │   RELAY (Сервер / Pi) │
-     │        Python         │ ◄═══════════════════════════► │      Go / Python      │ ──► Интернет
-     │   (oneme_caller.py)   │      WebRTC DataChannel       │  (calltunnel-relay)   │
-     │   (socks5_server.py)  │     (AES-256-GCM + X25519)    │  (internal/relay)     │
+     │  CALLER (ПК/Телефон)  │   Звонок OneMe через OkCDN    │   RELAY (Сервер / Pi) │
+     │      Go / Python      │ ◄═══════════════════════════► │      Go / Python      │ ──► Интернет
+     │  (calltunnel-caller)  │      WebRTC DataChannel       │  (calltunnel-relay)   │
+     │   (Android Termux)    │     (AES-256-GCM + X25519)    │  (internal/relay)     │
      └───────────────────────┘                               └───────────────────────┘
 ```
 
-1. **Caller (клиент на ПК)**:
-   - Запускает локальный SOCKS5-прокси (`127.0.0.1:1080`).
-   - Авторизуется в сигналинге OneMe (`api.oneme.ru` / `videowebrtc.okcdn.ru`).
-   - Инициирует защищённый звонок на указанный ID аккаунта релея.
-   - Мультиплексирует клиентские TCP-сессии в защищённый канал WebRTC DataChannel.
+1. **Caller (клиент на Android / Termux / ПК / macOS / Windows)**:
+   - Скомпилирован в **один автономный статический Go-бинарник** (`gotunnel/dist/calltunnel-caller-*`), не требующий Python, pip, GCC или внешних библиотек.
+   - Поднимает локальный SOCKS5-прокси (`127.0.0.1:1080`).
+   - Инициирует звонок через OneMe шлюз (`api.oneme.ru` / `videowebrtc.okcdn.ru`).
+   - Автоматически переподключается при смене сетей (Wi-Fi ↔ LTE) и отправляет keepalive-пинги.
+   - Доступна также альтернативная Python-реализация (`oneme_caller.py`).
 
-2. **Relay (принимающая сторона на Raspberry Pi или VPS)**:
-   - Доступен как на **Go** (`gotunnel/dist/calltunnel-relay-linux-*` — статический бинарник ~8 МБ, потребляет ~15 МБ RAM, идеален для Pi Zero 2 W), так и на **Python** (`oneme_client.py`).
-   - Ожидает входящие звонки на аккаунте.
-   - Открывает реальные TCP-соединения к целевым хостам в интернет и транслирует данные обратно.
+2. **Relay (принимающая сторона на Raspberry Pi / Linux / VPS)**:
+   - Доступен на **Go** (`gotunnel/dist/calltunnel-relay-*` — статический бинарник ~8 МБ, потребляет ~15 МБ RAM, идеален для Pi Zero 2 W) и на **Python** (`oneme_client.py`).
+   - Ожидает входящие вызовы, проверяет Call Knocking билет, открывает TCP-соединения в интернет.
+   - Автоматически восстанавливает соединение со шлюзом OneMe при обрывах связи.
 
 ---
 
-## 🔒 Безопасность и Zero-Trust аутентификация
+## 🔒 Безопасность и Zero-Trust протокол
 
 В проект встроена многоуровневая криптографическая защита, не зависящая от серверов мессенджера:
 
@@ -49,43 +50,77 @@
 
 ---
 
-## ⚡ Оптимизация и стабильность WebRTC под нагрузкой
+## 📱 Полная адаптация под Android и Termux (Все фиксы)
 
-При активном сёрфинге (видео на Twitch, YouTube, открытие 50+ параллельных TCP-сокетов) стандартный стек WebRTC сталкивается с ограничениями. В проект внесены критические доработки:
+При запуске на мобильных устройствах под управлением Android (в среде Termux) стандартные сетевые приложения сталкиваются с системными ограничениями ОС. В GoTunnel все эти проблемы решены "из коробки":
 
-- **Resilient STUN Consent Freshness (RFC 7675)**: в `aioice` стандартный опрос согласия выполняется с 500-мс таймаутом без повторов, из-за чего при заполнении сетевых очередей звонок падал с `Consent to send expired`. В [webrtc_call.py](file:///home/nkmr/proj_19/webrtc_call.py) внедрены повторные попытки (`retransmissions=2`), повышен лимит сбоев до 15 и активирован учёт активности потока данных (если пир шлёт данные, согласие считается подтверждённым).
-- **Фильтрация пар TURN-кандидатов**: предотвращены ошибки 403 Forbidden на публичных релеях при попытке спаривания с частными локальными IP.
-- **Поддержка комбинированных DTLS-сертификатов**: поддержка ECDSA и RSA шифров для совместимости с различными клиентами.
-- **Увеличенные таймауты подключения в SOCKS5**: таймаут подтверждения поднят до 15 секунд для согласованности с сетевым диалером релея.
+### 1. Сертификаты TLS и Минцифры России
+* **Симптом**: Ошибка `tls: failed to verify certificate: x509: certificate signed by unknown authority`.
+* **Причина**: Шлюз `api.oneme.ru` и CDN-серверы используют сертификаты Национального удостоверяющего центра (Минцифры России), которых нет в доверенных хранилищах Android и Mozilla. Кроме того, в Termux отсутствует стандартный системный путь `/etc/ssl/certs/ca-certificates.crt`.
+* **Решение**:
+  - В бинарник напрямую вшит полный CA-бандл (185 КБ), включающий актуальные сертификаты **Mozilla Web PKI** + корневые и выпускающие сертификаты **Минцифры России (Russian Trusted Root CA / Sub CA)**.
+  - Реализован автоматический сканер системных путей Android (`/apex/com.android.conscrypt/cacerts`, `/system/etc/security/cacerts`, `$PREFIX/etc/tls/cert.pem`).
+  - Добавлены флаг `-k` / `--insecure` и опция `"insecure_skip_verify": true` для аварийного отключения проверки при необходимости.
+
+### 2. DNS-резолвинг на Android (`dnsproxyd` + публичные апстримы)
+* **Симптом**:
+  1. `dial tcp: lookup api.oneme.ru on [::1]:53: read: connection refused` (в Termux нет `/etc/resolv.conf`).
+  2. `lookup api.oneme.ru: i/o timeout` (Go пытался слать DNS-запросы без учёта длины пакетов).
+* **Решение**:
+  - Модуль `internal/netx/dns.go` на лету обнаруживает Unix-сокет Android `/dev/socket/dnsproxyd` и использует встроенный системный резолвер ОС Android (учитывает текущий Wi-Fi, мобильный интернет и системные настройки DNS).
+  - Если сокет недоступен, автоматически включается параллельный опрос публичных апстримов (Яндекс `77.88.8.8`, Cloudflare `1.1.1.1`, Google `8.8.8.8`) по UDP и TCP с корректной длиной кадров (`streamConn`).
+  - Добавлен флаг `-dns <ip>` (например, `-dns 77.88.8.8`).
+
+### 3. Обход блокировки SELinux Netlink на Android 11+ (`netlinkrib: permission denied`)
+* **Симптом**: `failed to create network: route ip+net: netlinkrib: permission denied` при вызове `CreateOffer`.
+* **Причина**: На Android 11+ в непривилегированном окружении SELinux запрещает создание Netlink-сокетов (`AF_NETLINK`) для перечисления сетевых интерфейсов.
+* **Решение**:
+  - Разработан `ResilientNet` (`internal/netx/pion_net.go`), полностью заменяющий сетевой интерфейс для Pion WebRTC.
+  - Определение IP-адресов устройства выполняется через UDP route probe сокеты (без вызова Netlink) и чтение `/proc/net/dev`.
+  - Отключен mDNS (`MulticastDNSModeDisabled`), также вызывавший сбой Netlink.
+  - Пропатчен модуль интерфейсов `anet`. В результате приложение запускается в Termux **без root-прав**!
+
+### 4. Защита от разрывов: Keepalive Pings и Auto-Reconnect
+* **Симптом**: Ошибка `software caused connection abort` -> `gateway connection lost` при засыпании экрана или смене сетей (Wi-Fi ↔ LTE).
+* **Причина**: Мобильные NAT-роутеры и операторские CGNAT сбрасывают неактивные TCP-сессии; кратковременный обрыв сети приводит к завершению процесса.
+* **Решение**:
+  - Каждые 20 секунд в шлюз OneMe отправляются WebSocket RFC 6455 Ping-фреймы, что держит NAT-таблицы активными.
+  - Встроен двойной цикл автоматического переподключения (как внутри логики шлюза, так и в `main`): при любом разрыве процесс ждёт 3 секунды, переподключается, авторизуется и возобновляет работу прокси без участия пользователя.
+
+### 5. Обработка повторных ответов сигналинга
+* **Симптом**: `SetRemoteDescription failed: InvalidModificationError: invalid proposed signaling state transition: stable->SetRemote(answer)->stable`.
+* **Решение**: `internal/signal/signal.go` безопасно подавляет дубликаты SDP-ответов от SFU, приходящие после перехода в состояние `stable`.
 
 ---
 
 ## 📁 Структура проекта
 
 ```text
-/home/nkmr/proj_19/
-├── oneme_caller.py              # Клиентская часть (Python): запуск звонка и SOCKS5-прокси
-├── oneme_client.py              # Серверная часть (Python): приём звонка и ретрансляция
-├── socks5_server.py             # Локальный асинхронный SOCKS5-сервер
-├── tunnel_crypto.py             # Криптография туннеля (AES-GCM, X25519, Call Knocking)
+/
+├── gotunnel/                    # Высокопроизводительный Go-клиент и релей (единые бинарники)
+│   ├── cmd/caller/main.go       # Точка входа клиента со встроенным SOCKS5-прокси
+│   ├── cmd/relay/main.go        # Точка входа релея
+│   ├── internal/caller/         # OneMe Caller: авторизация, звонок, Auto-Redial
+│   ├── internal/callclient/     # OneMe Callee: приём входящих звонков
+│   ├── internal/socks5/         # Локальный RFC 1928 SOCKS5-сервер
+│   ├── internal/relay/          # TCP-мультиплексор (горутины)
+│   ├── internal/signal/         # Pion WebRTC + сигналинг ws2
+│   ├── internal/tunnelcrypto/   # Порт X25519 + AES-GCM
+│   ├── internal/proto/          # Парсер пакетов OneMe, MsgPack + LZ4
+│   ├── internal/netx/           # DNS dnsproxyd, Root CA Минцифры, ResilientNet (Android fix)
+│   ├── dist/                    # Скомпилированные бинарники под все платформы
+│   ├── vendor/                  # Автономные зависимости для офлайн-сборки
+│   └── Makefile                 # Скрипт сборки под все платформы
+│
+├── oneme_caller.py              # Клиентская часть (Python, fallback)
+├── oneme_client.py              # Серверная часть (Python, fallback)
+├── socks5_server.py             # Локальный асинхронный SOCKS5-сервер (Python)
+├── tunnel_crypto.py             # Криптография туннеля (Python)
 ├── tunnel_relay.py              # Модуль мультиплексирования TCP-соединений (Python)
-├── webrtc_call.py               # Сигналинг OneMe/OkCDN и логика WebRTC (aiortc/aioice)
-├── oneme_proto.py               # Кодирование протокола OneMe (MsgPack, LZ4, VCP-параметры)
+├── webrtc_call.py               # Сигналинг OneMe/OkCDN и логика WebRTC (Python)
+├── oneme_proto.py               # Кодирование протокола OneMe (Python)
 ├── config.example.json          # Пример конфигурации релея
-├── config_caller.example.json   # Пример конфигурации клиента
-├── .gitignore                   # Настройки игнорирования Git
-│
-├── gotunnel/                    # Высокопроизводительный Go-релей для Raspberry Pi / серверов
-│   ├── cmd/relay/main.go        # Точка входа Go-релея
-│   ├── internal/callclient/     # OneMe WebSocket клиент на Go
-│   ├── internal/relay/          # Быстрый TCP-прокси мультиплексор (горутины)
-│   ├── internal/signal/         # WebRTC сигналинг и Pion WebRTC на Go
-│   ├── internal/tunnelcrypto/   # Порт X25519 + AES-GCM на Go
-│   ├── internal/proto/          # Парсер пакетов OneMe на Go
-│   ├── deploy/                  # systemd сервис и примеры
-│   └── Makefile                 # Сборка под x86_64, arm64, armv7, armv6
-│
-└── scratch/                     # Вспомогательные скрипты исследования протокола и тесты
+└── config_caller.example.json   # Пример конфигурации клиента
 ```
 
 ---
@@ -94,7 +129,7 @@
 
 ### 1. Получение токенов OneMe
 
-Вам понадобятся **два отдельных аккаунта OneMe/Max** (один для релея на Pi, второй для клиента на ПК):
+Вам понадобятся **два отдельных аккаунта OneMe/Max** (один для релея на Pi, второй для клиента на телефоне/ПК):
 1. Откройте [web.max.ru](https://web.max.ru) в браузере под нужным аккаунтом.
 2. Откройте DevTools (F12) → вкладка Console.
 3. Выполните:
@@ -109,7 +144,7 @@
 
 Сгенерируйте ключевые пары для клиента и релея:
 ```bash
-python3 oneme_caller.py --gen-key
+./gotunnel/dist/calltunnel-caller -gen-key
 ```
 Вывод покажет:
 ```text
@@ -117,122 +152,113 @@ Generated X25519 Keypair:
   Private Key: <64-hex символа приватного ключа>
   Public Key:  <64-hex символа публичного ключа>
 ```
-*Сгенерируйте две пары: одну для релея (Pi), другую для звонящего (ПК).*
+*Сгенерируйте две пары: одну для релея (Pi), другую для звонящего (телефон/ПК).*
 
 ---
 
-### 3. Настройка и запуск релея (Raspberry Pi)
+### 3. Настройка и запуск релея (Raspberry Pi / Linux / VPS)
 
-#### Вариант А: Использование Go-бинарника (Рекомендуется)
-1. Соберите бинарник под архитектуру вашей платы (например, на хост-машине):
+1. Соберите бинарники или возьмите готовый из `gotunnel/dist/`:
    ```bash
-   cd gotunnel
-   make all
+   cd gotunnel && make all
    ```
-   *Готовые бинарники появятся в `gotunnel/dist/`:*
-   - `calltunnel-relay-linux-arm64` — 64-bit Raspberry Pi OS (Pi Zero 2 W, Pi 3, 4, 5).
-   - `calltunnel-relay-linux-armv7` — 32-bit Raspberry Pi OS.
+   *Файлы в `gotunnel/dist/`:*
+   - `calltunnel-relay-linux-arm64` — 64-bit Linux ARM64 (Raspberry Pi 3, 4, 5, Pi Zero 2 W, ARM64 VPS).
+   - `calltunnel-relay-linux-amd64` — 64-bit Linux x86_64 (VPS, домашний сервер, ПК).
+   - `calltunnel-relay-linux-armv7` — 32-bit Raspberry Pi OS (Pi 2, 3, 4 в 32-битном режиме).
+   - `calltunnel-relay-linux-armv6` — Raspberry Pi 1, Pi Zero (ARMv6).
+   - `calltunnel-relay-windows-amd64.exe` — Windows x64.
+   - `calltunnel-relay-darwin-arm64` — macOS (Apple Silicon).
 
-2. Скопируйте на Raspberry Pi:
-   ```bash
-   scp dist/calltunnel-relay-linux-arm64 deploy/config.example.json deploy/calltunnel-relay.service pi@192.168.0.8:/tmp/
-   ```
-
-3. Установите сервис на Raspberry Pi:
-   ```bash
-   sudo useradd -r -s /usr/sbin/nologin calltunnel
-   sudo mkdir -p /opt/calltunnel
-   sudo install -m755 /tmp/calltunnel-relay-linux-arm64 /opt/calltunnel/calltunnel-relay
-   sudo install -m600 -o calltunnel /tmp/config.example.json /opt/calltunnel/config.json
-   ```
-
-4. Заполните `/opt/calltunnel/config.json`:
+2. Создайте файл конфигурации `config.json`:
    ```json
    {
      "token": "<ТОКЕН_АККАУНТА_PI>",
      "private_key": "<ПРИВАТНЫЙ_КЛЮЧ_PI_HEX>",
      "allowed_peers": [
-       "<ПУБЛИЧНЫЙ_КЛЮЧ_ПК_HEX>"
+       "<ПУБЛИЧНЫЙ_КЛЮЧ_ТЕЛЕФОНА_HEX>"
      ]
    }
    ```
 
-5. Активируйте systemd-сервис:
+3. Запустите релей:
    ```bash
-   sudo cp /tmp/calltunnel-relay.service /etc/systemd/system/
-   sudo systemctl daemon-reload
-   sudo systemctl enable --now calltunnel-relay
-   journalctl -u calltunnel-relay -f
+   ./calltunnel-relay-linux-arm64 -config config.json
    ```
-
-#### Вариант Б: Запуск на Python
-```bash
-python3 oneme_client.py -c config.json
-```
 
 ---
 
-### 4. Настройка и запуск клиента (ПК)
+### 4. Настройка и запуск клиента (Телефон Android в Termux / ПК)
 
-1. Установите зависимости Python:
+1. Скопируйте файл `calltunnel-caller-linux-arm64` на телефон (в каталог Termux):
    ```bash
-   pip install aiortc websockets msgpack lz4 cryptography
+   chmod +x calltunnel-caller-linux-arm64
    ```
 
-2. Создайте файл `config_caller.json` (скопируйте из `config_caller.example.json`):
+2. Создайте `config_caller.json`:
    ```json
    {
      "callee_id": 12345678,
-     "token": "<ТОКЕН_АККАУНТА_ПК>",
+     "token": "<ТОКЕН_АККАУНТА_ТЕЛЕФОНА>",
      "proxy_host": "127.0.0.1",
      "proxy_port": 1080,
      "audio_only": false,
-     "private_key": "<ПРИВАТНЫЙ_КЛЮЧ_ПК_HEX>",
+     "private_key": "<ПРИВАТНЫЙ_КЛЮЧ_ТЕЛЕФОНА_HEX>",
      "peer_public_key": "<ПУБЛИЧНЫЙ_КЛЮЧ_PI_HEX>"
    }
    ```
 
-3. Запустите звонок (без необходимости указывать параметры в командной строке):
+3. Запустите клиент:
    ```bash
-   python3 oneme_caller.py -c config_caller.json
-   # или просто:
-   python3 oneme_caller.py
+   ./calltunnel-caller-linux-arm64 -c config_caller.json
+   ```
+   Логи покажут:
+   ```text
+   [DNS] Android system dnsproxyd detected (/dev/socket/dnsproxyd). Using native Android resolver.
+   Connected to wss://api.oneme.ru/websocket!
+   Logged in successfully as caller '123456789'!
+   Call initiated successfully!
+   [Signaling] WebRTC session established and running indefinitely.
+   [WebRTC DataChannel] OPENED successfully!
+   [Auth] Handshake SUCCESSFUL! PFS session established.
+   [SOCKS5 PROXY ACTIVE] Listening on 127.0.0.1:1080!
    ```
 
 4. Проверьте работоспособность туннеля через SOCKS5:
    ```bash
    curl -x socks5h://127.0.0.1:1080 https://api.ipify.org
    ```
-   Команда вернёт публичный IP-адрес интернет-подключения релея (Raspberry Pi)!
+   Команда вернёт публичный IP-адрес интернет-подключения релея (Raspberry Pi / VPS)!
 
 ---
 
-## ⚙️ Параметры командной строки `oneme_caller.py`
+## ⚙️ Параметры командной строки `calltunnel-caller`
 
 | Параметр | Описание |
 |---|---|
-| `-c`, `--config` | Путь к файлу конфигурации (по умолчанию `config_caller.json`) |
-| `callee_id` | ID аккаунта OneMe, принимающего звонок (если не задан в конфиге) |
-| `-t`, `--token` | Токен авторизации звонящего (`__oneme_auth`) |
-| `--privkey` | Асимметричный приватный ключ Curve25519 (hex) |
-| `--peer-pubkey` | Публичный ключ Curve25519 релея (hex) |
-| `-s`, `--secret` | Общий пароль шифрования (симметричный legacy-режим) |
-| `--proxy-port` | Порт локального SOCKS5-прокси (по умолчанию `1080`) |
-| `--proxy-host` | Хост локального SOCKS5-прокси (по умолчанию `127.0.0.1`) |
-| `--audio-only` | Инициировать только аудио-звонок (без видеотрека) |
-| `--gen-key` | Сгенерировать пару ключей X25519 и выйти |
+| `-c`, `-config` | Путь к файлу конфигурации (по умолчанию `config_caller.json`) |
+| `<callee_id>` | Числовой ID аккаунта OneMe, принимающего звонок (позиционный аргумент) |
+| `-t`, `-token` | Токен авторизации звонящего (`__oneme_auth`) |
+| `-privkey` | Асимметричный приватный ключ X25519 (hex) |
+| `-peer-pubkey` | Публичный ключ X25519 релея (hex) |
+| `-s`, `-secret` | Общий пароль шифрования (симметричный legacy-режим) |
+| `-p`, `-proxy-port` | Порт локального SOCKS5-прокси (по умолчанию `1080`) |
+| `-proxy-host` | Хост локального SOCKS5-прокси (по умолчанию `127.0.0.1`) |
+| `-dns` | Ручное переопределение DNS (например: `-dns 77.88.8.8`) |
+| `-k`, `-insecure` | Пропуск валидации TLS-сертификатов |
+| `-audio-only` | Инициировать только аудио-звонок (без видеотрека) |
+| `-gen-key` | Сгенерировать пару ключей X25519 и выйти |
 
 ---
 
 ## 🧪 Тестирование
 
-Для запуска сквозных тестов криптографии и совместимости:
 ```bash
 cd gotunnel
 make test
 ```
 Тесты проверяют:
-- Совместимость шифрования и расшифровки между Python и Go (AES-GCM векторы);
+- Взаимную совместимость шифрования и расшифровки между Python и Go (AES-GCM векторы);
 - Корректность кодирования/декодирования бинарных фреймов OneMe и VCP параметров (LZ4 + Base64 + JSON);
 - Полный сквозной цикл TCP-проксирования релея на реальном сокете.
 

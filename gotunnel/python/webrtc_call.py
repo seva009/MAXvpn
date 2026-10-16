@@ -16,10 +16,50 @@ from tunnel_crypto import (
     HandshakeResponder,
     parse_key,
 )
-from socks5_server import Socks5Server
+import fractions
+import numpy as np
+from av import AudioFrame, VideoFrame
+from aiortc.mediastreams import AudioStreamTrack, VideoStreamTrack
 from tunnel_relay import TunnelRelay
 
 logger = logging.getLogger("webrtc_call")
+
+class DummyAudioTrack(AudioStreamTrack):
+    """Generates low-level comfort noise at minimal bitrate (48kHz, mono, 20ms frames)."""
+    kind = "audio"
+
+    def __init__(self):
+        super().__init__()
+        self._pts = 0
+
+    async def recv(self):
+        pts, time_base = self._pts, fractions.Fraction(1, 48000)
+        self._pts += 960  # 20ms at 48000Hz
+        data = np.random.randint(-8, 8, size=(1, 960), dtype=np.int16)
+        frame = AudioFrame.from_ndarray(data, layout="mono")
+        frame.sample_rate = 48000
+        frame.pts = pts
+        frame.time_base = time_base
+        return frame
+
+class DummyVideoTrack(VideoStreamTrack):
+    """Generates dummy video frames at 2 fps (320x240)."""
+    kind = "video"
+
+    def __init__(self):
+        super().__init__()
+        self._pts = 0
+        self._image = np.zeros((240, 320, 3), dtype=np.uint8)
+        self._image[:, :] = (30, 50, 70)  # Solid dark blue-gray image
+
+    async def recv(self):
+        pts, time_base = self._pts, fractions.Fraction(1, 2)
+        self._pts += 1
+        frame = VideoFrame.from_ndarray(self._image, format="bgr24")
+        frame.pts = pts
+        frame.time_base = time_base
+        await asyncio.sleep(0.5)  # 2 fps
+        return frame
 
 # Silence verbose external libraries, but keep SCTP, DataChannel and ICE detailed
 logging.getLogger("aiortc").setLevel(logging.WARNING)
@@ -458,7 +498,8 @@ class OKWebRTCSignaling:
         tunnel_secret: str = DEFAULT_TUNNEL_SECRET,
         private_key: str = None,
         peer_public_key: str = None,
-        allowed_peers: list[str] = None
+        allowed_peers: list[str] = None,
+        allow_local: bool = False,
     ):
         self.user_id = str(user_id)
         self.conv_id = conv_id
@@ -498,6 +539,7 @@ class OKWebRTCSignaling:
         self.watchdog_task = None
 
         # Speed test state
+        self.allow_local = bool(allow_local)
         self.speed_test_results = {}
         self._rx_bytes = 0
         self._rx_start_time = None
@@ -531,10 +573,26 @@ class OKWebRTCSignaling:
         config = RTCConfiguration(iceServers=ice_servers) if ice_servers else None
         self.pc = RTCPeerConnection(configuration=config)
 
-        # If caller, add standard audio transceiver and initialize DataChannel
+        # Add comfort noise audio track and dummy video track (if enabled)
+        self.pc.addTrack(DummyAudioTrack())
+        if self.is_video:
+            self.pc.addTrack(DummyVideoTrack())
+
+        # Drain incoming media tracks
+        @self.pc.on("track")
+        def on_track(track):
+            logger.info(f"[WebRTC] Remote media track incoming: kind={track.kind}")
+            async def _drain():
+                while not self.done_event.is_set():
+                    try:
+                        await track.recv()
+                    except Exception:
+                        break
+            asyncio.create_task(_drain())
+
+        # If caller, initialize DataChannel
         if self.is_caller:
-            self.pc.addTransceiver("audio", direction="sendrecv")
-            dc = self.pc.createDataChannel("tunnel_poc", ordered=True)
+            dc = self.pc.createDataChannel("data", ordered=True)
             if self.pc.sctp:
                 self.pc.sctp._force_is_server = False
             self.setup_datachannel(dc)
@@ -607,7 +665,8 @@ class OKWebRTCSignaling:
                 self.tunnel = TunnelRelay(
                     crypto=crypto,
                     send_packet_fn=self.send_channel_bytes,
-                    get_buffered_amount=lambda: self.dc.bufferedAmount if self.dc else 0
+                    get_buffered_amount=lambda: self.dc.bufferedAmount if self.dc else 0,
+                    allow_local=self.allow_local
                 )
                 logger.info(
                     f"\n{'='*70}\n"
@@ -689,7 +748,8 @@ class OKWebRTCSignaling:
                 self.tunnel = TunnelRelay(
                     crypto=crypto,
                     send_packet_fn=self.send_channel_bytes,
-                    get_buffered_amount=lambda: self.dc.bufferedAmount if self.dc else 0
+                    get_buffered_amount=lambda: self.dc.bufferedAmount if self.dc else 0,
+                    allow_local=self.allow_local
                 )
                 logger.info(
                     f"\n{'='*70}\n"
@@ -737,7 +797,8 @@ class OKWebRTCSignaling:
                                 self.tunnel = TunnelRelay(
                                     crypto=crypto,
                                     send_packet_fn=self.send_channel_bytes,
-                                    get_buffered_amount=lambda: self.dc.bufferedAmount if self.dc else 0
+                                    get_buffered_amount=lambda: self.dc.bufferedAmount if self.dc else 0,
+                                    allow_local=self.allow_local
                                 )
                                 logger.info("[Auth] Handshake SUCCESSFUL! Caller authenticated.")
                                 logger.info(
@@ -1055,9 +1116,26 @@ class OKWebRTCSignaling:
         await asyncio.sleep(seconds)
         self.done_event.set()
 
+    def _set_remote_pid(self, v):
+        if v is None:
+            return
+        s = str(v).strip()
+        if s.isdigit() and int(s) > 0:
+            if s != str(self.user_id):
+                self.remote_participant_id = s
+        else:
+            logger.warning(f"[Signaling] Ignoring non-numeric participantId: {v}")
+
     def _target_participant_id(self):
         if self.remote_participant_id and str(self.remote_participant_id).isdigit():
             return int(self.remote_participant_id)
+        if self.remote_participant_id:
+            try:
+                val = int(float(self.remote_participant_id))
+                if val > 0:
+                    return val
+            except (ValueError, TypeError):
+                pass
         return self.remote_participant_id
 
     async def _send_offer(self):
@@ -1085,6 +1163,8 @@ class OKWebRTCSignaling:
         await self.send_command(
             "transmit-data",
             participantId=target_pid,
+            participantType="USER",
+            deviceIdx=0,
             data={
                 "sdp": {
                     "type": "offer",
@@ -1108,6 +1188,8 @@ class OKWebRTCSignaling:
                 await self.send_command(
                     "transmit-data",
                     participantId=target_pid,
+                    participantType="USER",
+                    deviceIdx=0,
                     data={
                         "candidate": {
                             "candidate": c_line,
@@ -1238,16 +1320,16 @@ class OKWebRTCSignaling:
                         conv = msg.get("conversation", {})
                         parts = conv.get("participants", [])
                         for p in parts:
-                            p_id = str(p.get("id"))
-                            if p_id != str(self.user_id):
-                                self.remote_participant_id = p_id
+                            p_id = p.get("id")
+                            if p_id is not None:
+                                self._set_remote_pid(p_id)
                                 if self.is_caller and p.get("state") == "ACCEPTED":
                                     asyncio.create_task(self._send_offer())
 
                     elif notif in ("accepted-call", "registered-peer"):
                         p_id = msg.get("participantId")
                         if p_id:
-                            self.remote_participant_id = str(p_id)
+                            self._set_remote_pid(p_id)
                         if isinstance(msg.get("peerId"), dict):
                             self.remote_peer_id = msg.get("peerId")
                         if self.is_caller:
@@ -1257,7 +1339,7 @@ class OKWebRTCSignaling:
                         if msg.get("state") == "ACCEPTED" or msg.get("participantState") == "ACCEPTED":
                             p_id = msg.get("participantId")
                             if p_id:
-                                self.remote_participant_id = str(p_id)
+                                self._set_remote_pid(p_id)
                             if isinstance(msg.get("peerId"), dict):
                                 self.remote_peer_id = msg.get("peerId")
                             if self.is_caller:
@@ -1277,7 +1359,7 @@ class OKWebRTCSignaling:
     async def _handle_transmitted_data(self, msg: dict):
         participant_id = msg.get("participantId")
         if participant_id:
-            self.remote_participant_id = str(participant_id)
+            self._set_remote_pid(participant_id)
         if isinstance(msg.get("peerId"), dict):
             self.remote_peer_id = msg.get("peerId")
 
@@ -1317,6 +1399,8 @@ class OKWebRTCSignaling:
                 await self.send_command(
                     "transmit-data",
                     participantId=target_pid,
+                    participantType="USER",
+                    deviceIdx=0,
                     data={
                         "sdp": {
                             "type": "answer",
@@ -1340,6 +1424,8 @@ class OKWebRTCSignaling:
                         await self.send_command(
                             "transmit-data",
                             participantId=target_pid,
+                            participantType="USER",
+                            deviceIdx=0,
                             data={
                                 "candidate": {
                                     "candidate": c_line,

@@ -1,5 +1,7 @@
 import asyncio
+import ipaddress
 import logging
+import socket
 from typing import Callable
 from tunnel_crypto import (
     TunnelCrypto,
@@ -14,6 +16,18 @@ logger = logging.getLogger("tunnel_relay")
 
 CHUNK_SIZE = 4096  # 4 KB chunk size for WebRTC DataChannel frames
 
+def is_restricted_target(host: str) -> bool:
+    try:
+        ip = ipaddress.ip_address(host)
+        return ip.is_loopback or ip.is_private or ip.is_link_local or ip.is_unspecified
+    except ValueError:
+        try:
+            addr = socket.gethostbyname(host)
+            ip = ipaddress.ip_address(addr)
+            return ip.is_loopback or ip.is_private or ip.is_link_local or ip.is_unspecified
+        except Exception:
+            return False
+
 class TunnelRelay:
     """
     Remote Relay that runs on the receiving side (Raspberry Pi / Server).
@@ -26,10 +40,12 @@ class TunnelRelay:
         crypto: TunnelCrypto,
         send_packet_fn: Callable[[bytes], bool],
         get_buffered_amount: Callable[[], int] = None,
+        allow_local: bool = False,
     ):
         self.crypto = crypto
         self.send_packet_fn = send_packet_fn
         self.get_buffered_amount = get_buffered_amount
+        self.allow_local = allow_local
         self.active_conns: dict[int, tuple[asyncio.StreamReader, asyncio.StreamWriter, asyncio.Task]] = {}
         self._running = True
 
@@ -98,6 +114,12 @@ class TunnelRelay:
     async def _handle_connect(self, conn_id: int, host: str, port: int):
         if not self._running:
             return
+        if not self.allow_local and is_restricted_target(host):
+            logger.warning(f"[Tunnel Relay] SSRF policy blocked connection to restricted target {host}:{port} for conn #{conn_id}")
+            pkt_fail = self.crypto.encrypt(CMD_CONNECT_FAIL, conn_id, b"connection to private/local network address is blocked by security policy")
+            self.send_packet_fn(pkt_fail)
+            return
+
         logger.info(f"[Tunnel Relay] Connecting to {host}:{port} for conn #{conn_id}...")
         try:
             reader, writer = await asyncio.wait_for(

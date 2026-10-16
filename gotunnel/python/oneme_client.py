@@ -243,7 +243,8 @@ class OneMeClient:
             mode=mode,
             tunnel_secret=tunnel_secret,
             private_key=self.config.get("private_key"),
-            allowed_peers=self.config.get("allowed_peers")
+            allowed_peers=self.config.get("allowed_peers"),
+            allow_local=self.config.get("allow_local", False)
         )
 
         try:
@@ -261,6 +262,7 @@ if __name__ == "__main__":
     parser.add_argument("--secret", "-s", type=str, default=None, help="AES encryption secret passphrase")
     parser.add_argument("--privkey", type=str, default=None, help="Asymmetric Curve25519 private key (hex)")
     parser.add_argument("--allowed-peers", type=str, default=None, help="Comma-separated allowed caller public keys (hex)")
+    parser.add_argument("--allow-local", "--allow-private", dest="allow_local", action="store_true", default=None, help="Allow clients to connect to local/private addresses (bypasses SSRF protection)")
     parser.add_argument("--gen-key", action="store_true", help="Generate Curve25519 keypair and exit")
     args = parser.parse_args()
 
@@ -280,6 +282,17 @@ if __name__ == "__main__":
         cfg["private_key"] = args.privkey
     if args.allowed_peers:
         cfg["allowed_peers"] = [p.strip() for p in args.allowed_peers.split(",") if p.strip()]
+    if args.allow_local is not None:
+        cfg["allow_local"] = args.allow_local
+
+    if cfg.get("allow_local"):
+        logger.warning("[SECURITY WARNING] SSRF protection is disabled: clients can connect to private and local network destinations.")
+    if not cfg.get("private_key") or not cfg.get("allowed_peers"):
+        logger.warning("[SECURITY WARNING] No X25519 private key or allowed peers configured!")
+        logger.warning("[SECURITY WARNING] Running in PSK fallback mode without cryptographic caller identity.")
+        logger.warning("[SECURITY WARNING] To generate a keypair, run: python3 oneme_client.py --gen-key")
+    if cfg.get("tunnel_secret", "oneme_webrtc_aes_tunnel_key") == "oneme_webrtc_aes_tunnel_key":
+        logger.warning("[SECURITY ALERT] Using default hardcoded tunnel secret! Change 'tunnel_secret' in config.json or specify -s <secret>.")
 
     client = OneMeClient(cfg)
     try:
